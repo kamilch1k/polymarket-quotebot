@@ -47,6 +47,7 @@ POLL_SECONDS = 8
 MIN_DAYS_OUT = 14        # only long-horizon markets (the whole thesis) — also
                          # the structural no-overlap guard vs the copybot
 MARKOUT_MIN = 30         # minutes after a fill at which adverse selection is scored
+INV_CAP_X = 3.0          # max |inventory| per market, in multiples of one quote's size
 REWARD_CAL = 1.0         # rewards_daily_rate is assumed $/day per unit; phase 1
                          # calibrates this against a real payout — until then
                          # the SHARE column is exact, the $ column is share×rate×CAL
@@ -68,7 +69,9 @@ SPORTY = (" vs", "o/u", "spread:", "win on", "1st half", "team to advance", "(bo
 
 LOCK = threading.Lock()
 STATE = {
-    "started": time.time(), "last_poll": 0.0, "log": deque(maxlen=200),
+    "started": time.time(),   # this process
+    "born": time.time(),      # the dataset (persisted — survives relaunches)
+    "last_poll": 0.0, "log": deque(maxlen=200),
     "markets": {},        # cid -> live market card (quotes, share, fills…)
     "fills": [],          # persisted paper fills (with markouts filled in later)
     "rewards_usd": 0.0,   # accrued simulated rewards (share × rate × CAL)
@@ -146,6 +149,20 @@ def sporty(title):
     return any(k in t for k in SPORTY)
 
 
+def unreal(pos, mid):
+    """Mark-to-mid P&L of the open (possibly short) paper position."""
+    return pos["sh"] * (mid - pos["cost"]) if pos["sh"] else 0.0
+
+
+def quote_sizes(sh, cap_sh, base):
+    """Inventory-aware arming: a side that would grow |inventory| past the cap
+    stays dark. Without this, paper inventory compounds one direction and the
+    experiment measures directional luck instead of LP economics."""
+    bid = base if sh < cap_sh else 0.0
+    ask = base if -sh < cap_sh else 0.0
+    return bid, ask
+
+
 def avg_cost_pnl(pos, px, sz, side):
     """Average-cost ledger step. pos = {'sh': signed shares, 'cost': avg price}.
     Returns realized P&L for the closing part of this fill and mutates pos."""
@@ -193,7 +210,7 @@ def load_state():
     if not STATE_FILE.exists():
         return
     s = json.loads(STATE_FILE.read_text())
-    for k in ("fills", "rewards_usd", "spread_pnl", "day_start"):
+    for k in ("fills", "rewards_usd", "spread_pnl", "day_start", "born"):
         STATE[k] = s.get(k, STATE[k])
     for cid, m in s.get("markets", {}).items():
         STATE["markets"][cid] = m
@@ -203,7 +220,7 @@ def save_state():
     with LOCK:
         data = {"fills": STATE["fills"][-500:], "rewards_usd": STATE["rewards_usd"],
                 "spread_pnl": STATE["spread_pnl"], "day_start": STATE["day_start"],
-                "markets": STATE["markets"]}
+                "born": STATE["born"], "markets": STATE["markets"]}
     STATE_FILE.write_text(json.dumps(data))
 
 
@@ -339,7 +356,8 @@ def poll_market(m):
         if "bid" in card:
             card["requotes"] += 1
         card["bid"], card["ask"] = want_bid, want_ask
-        card["bid_sz"] = card["ask_sz"] = round(side_usd / mid, 1)
+        base = round(side_usd / mid, 1)
+        card["bid_sz"], card["ask_sz"] = quote_sizes(card["pos"]["sh"], INV_CAP_X * base, base)
         card["mid_at_quote"] = mid
     card["mid"] = mid
 
@@ -450,12 +468,14 @@ def render():
         rewards, spread = STATE["rewards_usd"], STATE["spread_pnl"]
         last_poll, scan_note = STATE["last_poll"], STATE["scan_note"]
     inv = sum(m.get("inv_value", 0.0) for m in mkts.values())
+    unrl = sum(unreal(m.get("pos", {"sh": 0, "cost": 0}), m.get("mid", 0)) for m in mkts.values())
     scored = [f["markout"] for f in STATE["fills"] if f.get("markout") is not None]
-    adverse = sum(scored)
-    net = rewards + spread + adverse
-    up = time.time() - STATE["started"]
+    adverse = sum(scored)  # diagnostic of fill quality, NOT added to net (it
+    #                        would double-count what unrealized P&L already holds)
+    net = rewards + spread + unrl
+    up = time.time() - STATE["born"]
     days = max(up / 86400, 1e-9)
-    # annualizing minutes of uptime is numerology — earn a day of data first
+    # annualizing minutes of data is numerology — earn a day first
     apr = (f"{net / days / PAPER_BANKROLL * 365 * 100:+.0f}%/yr"
            if PAPER_BANKROLL and up >= 86400 else "—/yr (needs 24h)")
 
@@ -490,12 +510,13 @@ def render():
     poll_age = int(time.time() - last_poll) if last_poll else None
     return f"""<!doctype html><html><head><meta charset=utf-8>
 <title>Quotebot — paper LP</title>
-<script>/* flicker-free refresh: swap the body in place instead of reloading */
+<script>/* flicker-free refresh: DOM-parse the fetched page and swap the body —
+   never regex raw HTML (a regex here once matched its own source and injected it) */
 setInterval(async () => {{
   try {{
     const t = await (await fetch("/")).text();
-    const m = t.match(/<body>([\\s\\S]*)<\\/body>/);
-    if (m) document.body.innerHTML = m[1];
+    const doc = new DOMParser().parseFromString(t, "text/html");
+    if (doc.body) document.body.innerHTML = doc.body.innerHTML;
   }} catch (e) {{}}
 }}, 6000);
 </script><style>
@@ -519,11 +540,15 @@ a{{color:var(--info)}}</style></head><body><div class=wrap>
 bankroll ${PAPER_BANKROLL:g} (virtual) · {html.escape(scan_note or "first scan pending")}</div>
 <div class=cards>
 <div class=c><div class=k>simulated rewards</div><div class=v style=color:var(--ok)>${_fmt(rewards)}</div></div>
-<div class=c><div class=k>spread P&L (realized)</div><div class=v>{_fmt(spread, True)}$</div></div>
-<div class=c><div class=k>markouts ({MARKOUT_MIN}m adverse selection)</div><div class=v style="color:var({'--bad' if adverse < 0 else '--ok'})">{_fmt(adverse, True)}$</div></div>
-<div class=c><div class=k>inventory at marks</div><div class=v>{_fmt(inv, True)}$</div></div>
+<div class=c><div class=k>realized spread P&L</div><div class=v>{_fmt(spread, True)}$</div></div>
+<div class=c><div class=k>unrealized (open inventory)</div><div class=v style="color:var({'--bad' if unrl < 0 else '--ok'})">{_fmt(unrl, True)}$</div></div>
+<div class=c><div class=k>inventory value (not P&L)</div><div class="v dim">{_fmt(inv, True)}$</div></div>
+<div class=c><div class=k>fill quality ({MARKOUT_MIN}m markouts, diagnostic)</div><div class=v style="color:var({'--bad' if adverse < 0 else '--ok'})">{_fmt(adverse, True)}$</div></div>
 <div class=c><div class=k>net → annualized on ${PAPER_BANKROLL:g}</div><div class=v style="color:var({'--ok' if net >= 0 else '--bad'})">{_fmt(net, True)}$ · {apr}</div></div>
 </div>
+<div class=sub style=margin-top:-6px>net = rewards + realized + unrealized. Every dollar on this page is
+<b>simulated</b> — phase 0 holds no key, touches no wallet, and contains no order code (the self-test
+greps the file to keep that true).</div>
 <div class=card><h2>Watched reward markets (long-horizon, non-sports — copybot-disjoint by rule)</h2>
 <table><tr><th>market</th><th class=r>reward</th><th class=r>min sz</th><th class=r>band</th>
 <th class=r>mid</th><th class=r>our bid/ask</th><th class=r>share</th><th class=r>uptime</th>
@@ -591,10 +616,21 @@ def _check():
     # structural copybot separation: sports are refused
     assert sporty("France vs. Spain: Team to Advance") and sporty("Yankees O/U 8.5")
     assert not sporty("Will the Fed decrease interest rates in September?")
-    # dashboard renders without a network in sight; in-place refresh, no reloads
+    # unrealized P&L: longs gain up, shorts gain down; flat is flat
+    assert abs(unreal({"sh": 10, "cost": 0.40}, 0.50) - 1.0) < 1e-9
+    assert abs(unreal({"sh": -10, "cost": 0.40}, 0.30) - 1.0) < 1e-9
+    assert unreal({"sh": 0.0, "cost": 0.0}, 0.99) == 0.0
+    # inventory cap: the growing side goes dark at the cap, the shrinking side stays
+    assert quote_sizes(0, 300, 100) == (100, 100)
+    assert quote_sizes(300, 300, 100) == (0.0, 100)
+    assert quote_sizes(-300, 300, 100) == (100, 0.0)
+    # dashboard renders without a network in sight; DOM-parsed refresh (the raw-regex
+    # version once matched its own source and injected it into the page)
     page = render()
     assert "Quotebot" in page and "phase 0" in page and "no key" in page
-    assert "http-equiv=refresh" not in page and "flicker-free" in page
+    assert "http-equiv=refresh" not in page and "DOMParser" in page
+    assert "[\\s\\S]" not in page and "unrealized" in page
+    assert "touches no wallet" in page  # the no-real-money disclaimer stays on the page
     # phase-0 safety claim is grep-true: no order path exists in this file
     src = Path(__file__).read_text(encoding="utf-8")
     for needle in ("post_order", "create_order", "private_key", "eth_account", "OrderArgs"):
