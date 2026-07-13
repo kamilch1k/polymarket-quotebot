@@ -1,0 +1,5 @@
+quotebot_config.json
+quotebot_state.json
+quotebot_daily.jsonl
+watchdog_heal.log
+__pycache__/
