@@ -489,7 +489,16 @@ def render():
 
     poll_age = int(time.time() - last_poll) if last_poll else None
     return f"""<!doctype html><html><head><meta charset=utf-8>
-<meta http-equiv=refresh content=6><title>quotebot — paper LP</title><style>
+<title>Quotebot — paper LP</title>
+<script>/* flicker-free refresh: swap the body in place instead of reloading */
+setInterval(async () => {{
+  try {{
+    const t = await (await fetch("/")).text();
+    const m = t.match(/<body>([\\s\\S]*)<\\/body>/);
+    if (m) document.body.innerHTML = m[1];
+  }} catch (e) {{}}
+}}, 6000);
+</script><style>
 :root{{--bg:#0b0e14;--card:#131824;--ink:#e6e9f0;--dim:#8b93a7;--line:#232a3b;
 --ok:#4ade80;--bad:#f87171;--warn:#fbbf24;--info:#60a5fa;--accent:#a78bfa}}
 body{{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,Segoe UI,sans-serif;padding:20px}}
@@ -582,9 +591,10 @@ def _check():
     # structural copybot separation: sports are refused
     assert sporty("France vs. Spain: Team to Advance") and sporty("Yankees O/U 8.5")
     assert not sporty("Will the Fed decrease interest rates in September?")
-    # dashboard renders without a network in sight
+    # dashboard renders without a network in sight; in-place refresh, no reloads
     page = render()
-    assert "quotebot" in page and "phase 0" in page and "no key" in page
+    assert "Quotebot" in page and "phase 0" in page and "no key" in page
+    assert "http-equiv=refresh" not in page and "flicker-free" in page
     # phase-0 safety claim is grep-true: no order path exists in this file
     src = Path(__file__).read_text(encoding="utf-8")
     for needle in ("post_order", "create_order", "private_key", "eth_account", "OrderArgs"):
@@ -609,7 +619,17 @@ if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"quotebot: {url}")
-    if not HEADLESS:
-        webbrowser.open(url)
-    while True:
-        time.sleep(3600)
+    if HEADLESS:
+        while True:
+            time.sleep(3600)
+    try:
+        import webview  # native desktop window, same shell as the copybot
+        webview.create_window("Quotebot — paper LP", url, width=1180, height=900)
+        webview.start()  # returns when the window is closed
+        # window closed = process exits; the QuotebotWatchdog task revives the
+        # paper run headless within 10 min, so the dataset keeps growing
+        os._exit(0)
+    except ImportError:
+        webbrowser.open(url)  # no pywebview: a browser tab is the window
+        while True:
+            time.sleep(3600)
