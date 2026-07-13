@@ -74,6 +74,39 @@ python quotebot.py --headless  # no browser tab (service mode)
 paper run alive unattended (it kills/relaunches by command line, so it never
 touches the copybot's process — and vice versa).
 
+## Simulation (`sim.py`) — the two-week answer in one minute
+
+`python sim.py` runs ~150 Monte-Carlo 14-day episodes per scenario through the
+**same functions the live bot runs** (scoring, fills, inventory, ledger — only
+flow/jumps/competition are synthetic, calibrated from the four live watched
+markets: $100–625/day budgets, 47–837 prints/day, σ 2.6–7.2¢/day, 12¢ worst
+weekly jump). Net per 14 days on $400, across the two axes that decide
+everything:
+
+| competition \ toxicity | 0¢ (naive) | 1¢ | 2¢ (edge eaten) | 3¢ (toxic) |
+|---|---|---|---|---|
+| 4 hobby makers | +$3,983 | +$3,885 | +$3,060 | +$2,370 |
+| measured secondary books | +$1,812 | +$1,217 | +$603 | +$101 (64% green) |
+| one pro (5k sh @ 1¢) | +$1,271 | +$652 | +$89 (73%) | −$377 (11%) |
+| saturated pro band | +$1,027 | +$547 | −$17 (45%) | −$604 (3%) |
+
+What the grid teaches: **rewards share is the whole game** (competition
+compresses it 150×), **toxicity flips the sign** right around the quoted edge,
+and jump risk is a rounding error at 2¢ distance. A $153k LP account we
+measured earns ~0.1%/day on capital — consistent with equilibrium bands
+sitting near the bottom-right, where new entrants earn ≈0. The upper-left
+cells are transient first-mover niches; they are real (the scanner found one
+live) and they do not last.
+
+Two numbers the sim cannot know, and how they get pinned: **fill toxicity** —
+the live paper markouts measure it within days; **CAL** (whether
+`rewards_daily_rate` pays literal dollars, and above what thresholds) — one
+~$50 real qualifying quote resting for 48h reads the actual payout. Model
+honesty note: we first modeled toxicity as a post-fill price shove and the
+grid said toxicity was *profitable* — iid flow turns a shove into oscillation
+a grid quoter harvests. That model was discarded for a transparent per-fill EV
+haircut; the failed version is documented in the source as a warning.
+
 ## Honest limitations
 
 - the reward pool split can't see per-maker order pairing in the aggregate
