@@ -336,7 +336,14 @@ def scan_universe():
         except Exception:
             continue
     ranked.sort(key=lambda m: -m["exp_usd"])
-    return ranked[:N_MARKETS]
+    final, seenq = [], set()
+    for m in ranked:  # one variant per market family — twins ("$80 in July" /
+        key = (m["q"] or "")[:24].lower()  # "$85 in July") are correlated data
+        if key in seenq:
+            continue
+        seenq.add(key)
+        final.append(m)
+    return final[:N_MARKETS]
 
 
 # ---- the paper quoting engine -----------------------------------------------------
