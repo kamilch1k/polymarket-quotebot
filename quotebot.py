@@ -73,6 +73,7 @@ STATE = {
     "born": time.time(),      # the dataset (persisted — survives relaunches)
     "last_poll": 0.0, "log": deque(maxlen=200),
     "markets": {},        # cid -> live market card (quotes, share, fills…)
+    "watched": [],        # chosen market universe (persisted — restarts resume, not rescan)
     "fills": [],          # persisted paper fills (with markouts filled in later)
     "rewards_usd": 0.0,   # accrued simulated rewards (share × rate × CAL)
     "spread_pnl": 0.0,    # realized round-trip P&L (avg-cost)
@@ -128,6 +129,17 @@ def yes_print(asset, price, size, side, yes_tid):
     if asset == yes_tid:
         return side.upper(), float(price), float(size)
     return ("SELL" if side.upper() == "BUY" else "BUY"), 1.0 - float(price), float(size)
+
+
+def merged_yes_book(book_yes, book_no):
+    """Both outcome books folded onto the YES token: a NO bid at p is a YES ask
+    at 1−p and vice versa. Competitors resting on the complement are invisible
+    to a single-book reading — merging stops the share estimate flattering us."""
+    bids = [(float(x["price"]), float(x["size"])) for x in book_yes.get("bids", [])]
+    asks = [(float(x["price"]), float(x["size"])) for x in book_yes.get("asks", [])]
+    bids += [(round(1 - float(x["price"]), 4), float(x["size"])) for x in book_no.get("asks", [])]
+    asks += [(round(1 - float(x["price"]), 4), float(x["size"])) for x in book_no.get("bids", [])]
+    return bids, asks
 
 
 def fill_against(quote_px, quote_sz, side, print_side, print_px, print_sz):
@@ -210,7 +222,8 @@ def load_state():
     if not STATE_FILE.exists():
         return
     s = json.loads(STATE_FILE.read_text())
-    for k in ("fills", "rewards_usd", "spread_pnl", "day_start", "born"):
+    for k in ("fills", "rewards_usd", "spread_pnl", "day_start", "born",
+              "watched", "last_scan"):
         STATE[k] = s.get(k, STATE[k])
     for cid, m in s.get("markets", {}).items():
         STATE["markets"][cid] = m
@@ -220,7 +233,8 @@ def save_state():
     with LOCK:
         data = {"fills": STATE["fills"][-500:], "rewards_usd": STATE["rewards_usd"],
                 "spread_pnl": STATE["spread_pnl"], "day_start": STATE["day_start"],
-                "born": STATE["born"], "markets": STATE["markets"]}
+                "born": STATE["born"], "markets": STATE["markets"],
+                "watched": STATE["watched"], "last_scan": STATE["last_scan"]}
     STATE_FILE.write_text(json.dumps(data))
 
 
@@ -297,7 +311,8 @@ def scan_universe():
                 side_usd = PAPER_BANKROLL / max(N_MARKETS, 1) / 2
                 if side_usd / mid < min_sz:
                     continue
-                out.append({"cid": cid, "tid": tids[0], "q": m.get("question"),
+                out.append({"cid": cid, "tid": tids[0], "tid_no": tids[1],
+                            "q": m.get("question"),
                             "rate": rate, "min_size": min_sz, "max_spread": max_sp,
                             "mid": mid, "days": round(days, 1)})
             except Exception:
@@ -306,17 +321,15 @@ def scan_universe():
     ranked = []
     for m in sorted(out, key=lambda m: -m["rate"])[:12]:
         try:
-            book = jget(f"{CLOB}/book", token_id=m["tid"])
+            bids, asks = merged_yes_book(jget(f"{CLOB}/book", token_id=m["tid"]),
+                                         jget(f"{CLOB}/book", token_id=m["tid_no"]))
             mid = m["mid"]
             side_usd = PAPER_BANKROLL / max(N_MARKETS, 1) / 2
             sz = side_usd / mid
             ours = two_sided(order_score(sz, QUOTE_DIST_C, m["max_spread"], m["min_size"]),
                              order_score(sz, QUOTE_DIST_C, m["max_spread"], m["min_size"]))
-            bookq = two_sided(
-                book_score([(float(x["price"]), float(x["size"])) for x in book.get("bids", [])],
-                           mid, m["max_spread"], m["min_size"]),
-                book_score([(float(x["price"]), float(x["size"])) for x in book.get("asks", [])],
-                           mid, m["max_spread"], m["min_size"]))
+            bookq = two_sided(book_score(bids, mid, m["max_spread"], m["min_size"]),
+                              book_score(asks, mid, m["max_spread"], m["min_size"]))
             share = our_share(ours, bookq)
             ranked.append({**m, "share": share, "exp_usd": share * m["rate"] * REWARD_CAL})
             time.sleep(0.15)
@@ -339,9 +352,9 @@ def poll_market(m):
     replay new tape prints against them, accrue reward share."""
     card = market_card(m["cid"])
     try:
-        book = jget(f"{CLOB}/book", token_id=m["tid"])
-        bids = [(float(x["price"]), float(x["size"])) for x in book.get("bids", [])]
-        asks = [(float(x["price"]), float(x["size"])) for x in book.get("asks", [])]
+        book_yes = jget(f"{CLOB}/book", token_id=m["tid"])
+        book_no = jget(f"{CLOB}/book", token_id=m["tid_no"]) if m.get("tid_no") else {}
+        bids, asks = merged_yes_book(book_yes, book_no)
         if not bids or not asks:
             return
         mid = (max(p for p, _ in bids) + min(p for p, _ in asks)) / 2
@@ -432,6 +445,11 @@ WATCHED = []
 
 def bot_loop():
     global WATCHED
+    if STATE["watched"] and time.time() - STATE["last_scan"] < SCAN_EVERY_H * 3600:
+        WATCHED = STATE["watched"]  # restart ≠ rescan: keep the dataset continuous
+        with LOCK:
+            STATE["scan_note"] = "resumed — watching " + ", ".join(w["q"][:28] for w in WATCHED)
+        logline(kind="live", note=f"resumed {len(WATCHED)} watched markets from state (scan not due)")
     while True:
         if not WATCHED or time.time() - STATE["last_scan"] > SCAN_EVERY_H * 3600:
             got = scan_universe()
@@ -440,6 +458,7 @@ def bot_loop():
             if got is not None:
                 WATCHED = got
                 with LOCK:
+                    STATE["watched"] = got
                     STATE["scan_note"] = (time.strftime("%H:%M") + " — watching "
                                           + ", ".join(w["q"][:28] for w in WATCHED))
                 logline(kind="live", note=f"universe scan: {len(WATCHED)} reward markets chosen")
@@ -544,6 +563,7 @@ bankroll ${PAPER_BANKROLL:g} (virtual) · {html.escape(scan_note or "first scan 
 <div class=c><div class=k>unrealized (open inventory)</div><div class=v style="color:var({'--bad' if unrl < 0 else '--ok'})">{_fmt(unrl, True)}$</div></div>
 <div class=c><div class=k>inventory value (not P&L)</div><div class="v dim">{_fmt(inv, True)}$</div></div>
 <div class=c><div class=k>fill quality ({MARKOUT_MIN}m markouts, diagnostic)</div><div class=v style="color:var({'--bad' if adverse < 0 else '--ok'})">{_fmt(adverse, True)}$</div></div>
+<div class=c><div class=k>current reward pace</div><div class=v>${sum(m["rate"] * mkts.get(m["cid"], {}).get("share", 0) for m in (WATCHED or [])):,.2f}/day</div></div>
 <div class=c><div class=k>net → annualized on ${PAPER_BANKROLL:g}</div><div class=v style="color:var({'--ok' if net >= 0 else '--bad'})">{_fmt(net, True)}$ · {apr}</div></div>
 </div>
 <div class=sub style=margin-top:-6px>net = rewards + realized + unrealized. Every dollar on this page is
@@ -597,6 +617,13 @@ def _check():
     assert yes_print("YES", 0.60, 5, "BUY", "YES") == ("BUY", 0.60, 5.0)
     s, p, z = yes_print("NO", 0.42, 7, "BUY", "YES")
     assert s == "SELL" and abs(p - 0.58) < 1e-9 and z == 7.0
+    # complement books fold onto YES: a NO ask at 0.62 is a YES bid at 0.38
+    mb, ma = merged_yes_book({"bids": [{"price": "0.40", "size": "10"}], "asks": []},
+                             {"bids": [{"price": "0.55", "size": "7"}],
+                              "asks": [{"price": "0.62", "size": "5"}]})
+    assert (0.40, 10.0) in mb and (0.38, 5.0) in mb and (0.45, 7.0) in ma and len(ma) == 1
+    mb2, ma2 = merged_yes_book({"bids": [], "asks": []}, {})  # missing NO book tolerated
+    assert mb2 == [] and ma2 == []
     # last-in-queue fill model: strict cross only
     assert fill_against(0.50, 100, "BUY", "SELL", 0.499, 30) == 30.0
     assert fill_against(0.50, 100, "BUY", "SELL", 0.500, 30) == 0.0   # at-price = queued behind
@@ -624,6 +651,16 @@ def _check():
     assert quote_sizes(0, 300, 100) == (100, 100)
     assert quote_sizes(300, 300, 100) == (0.0, 100)
     assert quote_sizes(-300, 300, 100) == (100, 0.0)
+    # watched universe survives a restart (restart ≠ rescan ≠ dataset gap)
+    STATE["watched"] = [{"cid": "w1", "tid": "t", "tid_no": "tn", "q": "Q?", "rate": 9,
+                         "min_size": 50, "max_spread": 4.5, "mid": 0.5, "days": 30.0}]
+    STATE["last_scan"] = time.time()
+    save_state()
+    STATE["watched"], STATE["last_scan"] = [], 0.0
+    load_state()
+    assert STATE["watched"][0]["cid"] == "w1" and STATE["last_scan"] > 0
+    STATE["watched"], STATE["last_scan"] = [], 0.0
+    STATE_FILE.unlink(missing_ok=True)
     # dashboard renders without a network in sight; DOM-parsed refresh (the raw-regex
     # version once matched its own source and injected it into the page)
     page = render()

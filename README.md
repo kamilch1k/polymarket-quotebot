@@ -111,7 +111,9 @@ haircut; the failed version is documented in the source as a warning.
 
 - the reward pool split can't see per-maker order pairing in the aggregate
   book, so the share estimate is approximate in crowded books (usually
-  *understated* for us); phase 1 calibrates
+  *understated* for us); phase 1 calibrates. Both outcome tokens' books are
+  merged before scoring (a NO bid is a YES ask) — a single-book reading would
+  miss competitors resting on the complement
 - `rewards_daily_rate` units are assumed $/day (consistent with the $100–600/d
   budgets observed on majors); the CAL knob absorbs any surprise
 - a paper quote can't move the queue or the market: real quoting attracts
