@@ -35,7 +35,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-import requests
+try:
+    import requests
+except ImportError:  # self-heal: install with THIS interpreter, then retry —
+    import subprocess  # a broken env must not strand the paper run on a banner
+    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "requests"],
+                   timeout=600, check=False)
+    import requests
 
 # ---- config (defaults; editable in the page) ---------------------------------
 PAPER_BANKROLL = 400.0   # virtual capital the simulation is allowed to deploy
