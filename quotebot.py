@@ -44,6 +44,14 @@ except ImportError:  # self-heal: install with THIS interpreter, then retry —
     import requests
 
 # ---- config (defaults; editable in the page) ---------------------------------
+LIVE = False             # PHASE 1 master switch. Off = pure paper (default).
+                         # On + funder + key = real GTC quotes, hard-capped below.
+FUNDER = ""              # the quotebot's OWN wallet — never the copybot's
+LIVE_BANKROLL = 100.0    # hard cap: total live order notional + inventory cost
+KILL_END_DAYS = 7.0      # cancel + stop quoting a market this close to its end
+KILL_MOVE_C = 3.0        # mid moved this many cents in 10 min = news → cancel,
+                         # pause that market 30 min (stale quotes get picked off)
+SIG_TYPE = 3             # Polymarket wallet signature type (3 = 2026 wallets)
 PAPER_BANKROLL = 400.0   # virtual capital the simulation is allowed to deploy
 N_MARKETS = 4            # how many reward markets to quote at once
 QUOTE_DIST_C = 2.0       # rest quotes this many cents off mid (closer = more
@@ -207,21 +215,34 @@ def avg_cost_pnl(pos, px, sz, side):
 
 # ---- persistence ---------------------------------------------------------------
 def load_config():
+    global PRIVATE_KEY_MEM
     if not CONFIG_FILE.exists():
         return
     c = json.loads(CONFIG_FILE.read_text())
     for k in ("paper_bankroll", "n_markets", "quote_dist_c", "requote_c",
-              "poll_seconds", "min_days_out", "reward_cal"):
+              "poll_seconds", "min_days_out", "reward_cal",
+              "live", "funder", "live_bankroll", "kill_end_days", "kill_move_c", "sig_type"):
         if k in c:
             globals()[k.upper()] = type(globals()[k.upper()])(c[k])
+    k = c.get("private_key") or ""
+    migrated = bool(k) and _vault_save(k)  # same discipline as the copybot
+    k = k or _vault_load()
+    if k:
+        PRIVATE_KEY_MEM = k
+    if migrated:
+        save_config()
 
 
 def save_config():
+    pk_out = "" if (PRIVATE_KEY_MEM and _vault_save(PRIVATE_KEY_MEM)) else (PRIVATE_KEY_MEM or "")
     CONFIG_FILE.write_text(json.dumps({
         "paper_bankroll": PAPER_BANKROLL, "n_markets": N_MARKETS,
         "quote_dist_c": QUOTE_DIST_C, "requote_c": REQUOTE_C,
         "poll_seconds": POLL_SECONDS, "min_days_out": MIN_DAYS_OUT,
-        "reward_cal": REWARD_CAL}, indent=2))
+        "reward_cal": REWARD_CAL,
+        "live": LIVE, "funder": FUNDER, "live_bankroll": LIVE_BANKROLL,
+        "kill_end_days": KILL_END_DAYS, "kill_move_c": KILL_MOVE_C,
+        "sig_type": SIG_TYPE, "private_key": pk_out}, indent=2))
 
 
 def load_state():
@@ -320,7 +341,8 @@ def scan_universe():
                 out.append({"cid": cid, "tid": tids[0], "tid_no": tids[1],
                             "q": m.get("question"),
                             "rate": rate, "min_size": min_sz, "max_spread": max_sp,
-                            "mid": mid, "days": round(days, 1)})
+                            "mid": mid, "days": round(days, 1),
+                            "end_ts": time.time() + days * 86400})
             except Exception:
                 continue
     # expected share for our size, against the live book (top candidates only)
@@ -386,6 +408,9 @@ def poll_market(m):
         card["bid_sz"], card["ask_sz"] = quote_sizes(card["pos"]["sh"], INV_CAP_X * base, base)
         card["mid_at_quote"] = mid
     card["mid"] = mid
+    hist = card.setdefault("mid_hist", [])
+    hist.append((time.time(), mid))
+    del hist[:-90]  # ~12 min at the default poll — enough for the 10-min move detector
 
     # tape replay (both outcome tokens, normalized onto YES)
     try:
@@ -453,6 +478,184 @@ def score_markouts():
                                   f"→ {f['markout']:+.2f}$")
 
 
+# ---- PHASE 1: the live quoting engine (flag-gated; paper keeps running) -------
+# A fresh wallet owns no outcome tokens, so it cannot rest a SELL. Two-sided
+# quoting is therefore two BUYS: YES at (mid−d) and NO at 1−(mid+d) — both
+# cash-collateralized, and exactly what the rewards formula counts as a
+# two-sided book. Filled pairs sum to $1 at resolution.
+def _vault_save(k):
+    try:
+        import keyring
+        keyring.set_password("quotebot", "private_key", k)
+        return keyring.get_password("quotebot", "private_key") == k
+    except Exception:
+        return False
+
+
+def _vault_load():
+    try:
+        import keyring
+        return keyring.get_password("quotebot", "private_key") or ""
+    except Exception:
+        return ""
+
+
+PRIVATE_KEY_MEM = None
+CLIENT = None
+ORDERS = {}        # cid -> {"yes": {"id","px","sz"}, "no": {...}} — our resting GTC orders
+LIVE_LEDGER = {"fills": 0, "rewards_paid": 0.0, "positions": [], "cash": None, "at": 0.0}
+
+
+def live_ok():
+    """The one gate every live action passes through: flag + creds, nothing else
+    trades. Paper mode never reaches the client."""
+    return bool(LIVE and FUNDER and (PRIVATE_KEY_MEM or _vault_load()))
+
+
+def get_client():
+    global CLIENT, PRIVATE_KEY_MEM
+    if CLIENT is None:
+        from py_clob_client_v2.client import ClobClient
+        PRIVATE_KEY_MEM = PRIVATE_KEY_MEM or _vault_load()
+        CLIENT = ClobClient("https://clob.polymarket.com", key=PRIVATE_KEY_MEM,
+                            chain_id=137, signature_type=SIG_TYPE, funder=FUNDER)
+        CLIENT.set_api_creds(CLIENT.create_or_derive_api_key())
+    return CLIENT
+
+
+def desired_quotes(mid, dist_c, size_sh):
+    """The two live orders a market should carry: (yes_price, no_price, size).
+    None when the mid sits too close to an edge for a symmetric two-sided quote."""
+    d = dist_c / 100.0
+    yes_px, no_px = round(mid - d, 3), round(1.0 - (mid + d), 3)
+    if not (0.01 <= yes_px <= 0.99 and 0.01 <= no_px <= 0.99):
+        return None
+    return yes_px, no_px, round(size_sh, 1)
+
+
+def needs_replace(resting, want_px, want_sz, tol_c=REQUOTE_C):
+    """Replace a resting order only when the desired price drifted ≥ tol —
+    churning cancels burns rate limits and queue position."""
+    if not resting:
+        return True
+    return abs(resting["px"] - want_px) * 100 >= tol_c or resting["sz"] != want_sz
+
+
+def live_notional():
+    """$ committed right now: resting order notional + held inventory cost."""
+    orders = sum(o["px"] * o["sz"] for m in ORDERS.values() for o in m.values() if o)
+    inv = sum(float(p.get("initialValue") or 0) for p in LIVE_LEDGER["positions"])
+    return orders + inv
+
+
+def kill_reasons(m, card, now=None):
+    """Why a market must NOT be live-quoted right now (empty list = clear)."""
+    now = now or time.time()
+    out = []
+    if m.get("end_ts") and m["end_ts"] - now < KILL_END_DAYS * 86400:
+        out.append(f"ends in {(m['end_ts'] - now) / 86400:.1f}d (< {KILL_END_DAYS:g}d)")
+    hist = card.get("mid_hist") or []
+    old = next((px for ts, px in hist if now - ts >= 600), None)
+    if old is not None and abs(card.get("mid", old) - old) * 100 > KILL_MOVE_C:
+        card["paused_until"] = now + 1800
+        out.append(f"mid moved {abs(card['mid'] - old) * 100:.1f}c in 10min — news pause")
+    if card.get("paused_until", 0) > now:
+        out.append("paused after a recent move")
+    return out
+
+
+def _cancel(cid, side_key):
+    o = ORDERS.get(cid, {}).get(side_key)
+    if not o:
+        return
+    try:
+        get_client().cancel(order_id=o["id"])
+        logline(kind="live", note=f"live: cancelled {side_key} order @ {o['px']} ({cid[:10]}…)")
+    except Exception as ex:
+        logline(kind="error", note=f"live cancel failed: {str(ex)[:70]}")
+    ORDERS.setdefault(cid, {})[side_key] = None
+
+
+def cancel_all_live(reason="manual"):
+    for cid in list(ORDERS):
+        for side_key in ("yes", "no"):
+            _cancel(cid, side_key)
+    logline(kind="live", note=f"live: all orders cancelled ({reason})")
+
+
+def _post(cid, side_key, tid, px, sz):
+    """One GTC BUY. The ONLY order type this file ever sends; there is no
+    market-order, no sell, no transfer anywhere in the live engine."""
+    try:
+        from py_clob_client_v2.clob_types import OrderArgs, OrderType
+        cl = get_client()
+        resp = cl.post_order(cl.create_order(OrderArgs(
+            token_id=tid, price=px, size=sz, side="BUY")), OrderType.GTC)
+        err = (resp.get("errorMsg") or "") if isinstance(resp, dict) else ""
+        oid = (resp.get("orderID") or "") if isinstance(resp, dict) else ""
+        if err or not oid:
+            logline(kind="error", note=f"live post rejected: {err[:70] or 'no order id'}")
+            return None
+        logline(kind="live", note=f"live: resting {side_key.upper()} BUY {sz} @ {px} ({cid[:10]}…)")
+        return {"id": oid, "px": px, "sz": sz}
+    except Exception as ex:
+        logline(kind="error", note=f"live post failed: {str(ex)[:70]}")
+        return None
+
+
+def live_sync(m, card):
+    """Bring one market's real resting orders in line with the paper engine's
+    desired quotes — same math, real money, hard caps. Called AFTER poll_market
+    so the paper measurement stays untouched."""
+    cid = m["cid"]
+    mine = ORDERS.setdefault(cid, {"yes": None, "no": None})
+    kills = kill_reasons(m, card)
+    if kills:
+        if mine["yes"] or mine["no"]:
+            _cancel(cid, "yes")
+            _cancel(cid, "no")
+            logline(kind="live", note=f"live: standing down on {m['q'][:34]} — {kills[0]}")
+        return
+    mid = card.get("mid")
+    if not mid:
+        return
+    side_usd = LIVE_BANKROLL / max(N_MARKETS, 1) / 2
+    want = desired_quotes(mid, QUOTE_DIST_C, max(side_usd / mid, m["min_size"]))
+    if not want:
+        return
+    yes_px, no_px, sz = want
+    for side_key, tid, px in (("yes", m["tid"], yes_px), ("no", m["tid_no"], no_px)):
+        if not needs_replace(mine[side_key], px, sz):
+            continue
+        _cancel(cid, side_key)
+        add = px * sz
+        if live_notional() + add > LIVE_BANKROLL + 1e-9:
+            logline(kind="error", note=f"live: cap ${LIVE_BANKROLL:g} would be exceeded — not posting")
+            continue
+        mine[side_key] = _post(cid, side_key, tid, px, sz)
+
+
+def poll_live_ledger():
+    """The real account, from public endpoints: positions, cash, actual REWARD
+    payouts (the CAL calibration number this whole experiment exists for)."""
+    if not FUNDER:
+        return
+    try:
+        pos = jget(f"{DATA_API}/positions", user=FUNDER, limit=100)
+        LIVE_LEDGER["positions"] = [p for p in pos if float(p.get("size") or 0) > 0] \
+            if isinstance(pos, list) else []
+    except Exception:
+        pass
+    try:
+        rows = jget(f"{DATA_API}/activity", user=FUNDER, limit=500)
+        LIVE_LEDGER["rewards_paid"] = sum(float(r.get("usdcSize") or 0) for r in rows
+                                          if isinstance(r, dict) and r.get("type") == "REWARD")
+        LIVE_LEDGER["fills"] = sum(1 for r in rows if isinstance(r, dict) and r.get("type") == "TRADE")
+    except Exception:
+        pass
+    LIVE_LEDGER["at"] = time.time()
+
+
 WATCHED = []
 
 
@@ -477,7 +680,11 @@ def bot_loop():
                 logline(kind="live", note=f"universe scan: {len(WATCHED)} reward markets chosen")
         for m in list(WATCHED):
             poll_market(m)
+            if live_ok():
+                live_sync(m, market_card(m["cid"]))
             time.sleep(0.2)
+        if live_ok() and time.time() - LIVE_LEDGER["at"] > 60:
+            poll_live_ledger()
         score_markouts()
         daily_rollup()
         with LOCK:
@@ -540,11 +747,16 @@ def render():
         f'{html.escape(str(e.get("note") or ""))}</span></div>' for e in log)
 
     poll_age = int(time.time() - last_poll) if last_poll else None
+    live = live_ok()
+    mode_badge = ('<span style="color:var(--bad)">● LIVE — real orders</span>' if live
+                  else '<span style="color:var(--ok)">◌ paper — no money</span>')
     return f"""<!doctype html><html><head><meta charset=utf-8>
-<title>Quotebot — paper LP</title>
+<title>Quotebot — {'LIVE' if live else 'paper'} LP</title>
 <script>/* flicker-free refresh: DOM-parse the fetched page and swap the body —
    never regex raw HTML (a regex here once matched its own source and injected it) */
 setInterval(async () => {{
+  const a = document.activeElement;
+  if (a && (a.tagName === "INPUT" || a.tagName === "TEXTAREA")) return;  // don't nuke a form you're typing in
   try {{
     const t = await (await fetch("/")).text();
     const doc = new DOMParser().parseFromString(t, "text/html");
@@ -566,10 +778,19 @@ table{{width:100%;border-collapse:collapse;font-size:13px}}
 th{{text-align:left;color:var(--dim);font-weight:600;padding:3px 8px 3px 0}}
 td{{padding:3px 8px 3px 0;border-top:1px solid var(--line)}} .r{{text-align:right}}
 .dim{{color:var(--dim)}} .lr{{font-size:12.5px;padding:1px 0}}
-a{{color:var(--info)}}</style></head><body><div class=wrap>
-<h1>quotebot <span class=dim style=font-size:13px>— paper LP experiment (phase 0: no orders, no key, no money)</span></h1>
+a{{color:var(--info)}}
+input,button{{font:inherit}} label{{display:block;font-size:12px;color:var(--dim);margin:6px 0 2px}}
+.in{{background:#0e1420;border:1px solid var(--line);border-radius:7px;color:var(--ink);padding:6px 9px;font-size:13px}}
+button.go{{background:var(--accent);color:#0b0e14;border:0;border-radius:7px;padding:7px 14px;font-weight:700;cursor:pointer}}
+button.kill{{background:#2a1520;color:var(--bad);border:1px solid var(--bad);border-radius:7px;padding:7px 14px;font-weight:700;cursor:pointer}}
+#toast{{position:fixed;left:50%;bottom:20%;transform:translateX(-50%);background:var(--card);border:1px solid var(--line);
+border-radius:10px;padding:11px 20px;font-weight:600;opacity:0;pointer-events:none;transition:opacity .25s;z-index:9;box-shadow:0 8px 28px rgba(0,0,0,.5)}}
+#toast.show{{opacity:1}}</style></head><body><div class=wrap>
+<h1>quotebot <span class=dim style=font-size:13px>— Polymarket LP-rewards bot</span> {mode_badge}</h1>
 <div class=sub>up {int(up // 3600)}h{int(up % 3600 // 60)}m · polled {poll_age if poll_age is not None else "—"}s ago ·
-bankroll ${PAPER_BANKROLL:g} (virtual) · {html.escape(scan_note or "first scan pending")}</div>
+paper bankroll ${PAPER_BANKROLL:g}{' · LIVE cap $' + format(LIVE_BANKROLL, 'g') if live else ''} ·
+{html.escape(scan_note or "first scan pending")}</div>
+{_live_card() if (LIVE or FUNDER) else ''}
 <div class=cards>
 <div class=c><div class=k>simulated rewards</div><div class=v style=color:var(--ok)>${_fmt(rewards)}</div></div>
 <div class=c><div class=k>realized spread P&L</div><div class=v>{_fmt(spread, True)}$</div></div>
@@ -579,9 +800,8 @@ bankroll ${PAPER_BANKROLL:g} (virtual) · {html.escape(scan_note or "first scan 
 <div class=c><div class=k>current reward pace</div><div class=v>${sum(m["rate"] * mkts.get(m["cid"], {}).get("share", 0) for m in (WATCHED or [])):,.2f}/day</div></div>
 <div class=c><div class=k>net → annualized on ${PAPER_BANKROLL:g}</div><div class=v style="color:var({'--ok' if net >= 0 else '--bad'})">{_fmt(net, True)}$ · {apr}</div></div>
 </div>
-<div class=sub style=margin-top:-6px>net = rewards + realized + unrealized. Every dollar on this page is
-<b>simulated</b> — phase 0 holds no key, touches no wallet, and contains no order code (the self-test
-greps the file to keep that true).</div>
+<div class=sub style=margin-top:-6px>net = rewards + realized + unrealized. These are the <b>paper</b> simulation numbers
+(real book, real tape, last-in-queue fills) — the phase-1 go/no-go signal. {'Live orders run in parallel and are shown in the LIVE panel above.' if live else 'Live quoting is OFF; enable it in Settings once the paper number is green.'}</div>
 <div class=card><h2>Watched reward markets (long-horizon, non-sports — copybot-disjoint by rule)</h2>
 <table><tr><th>market</th><th class=r>reward</th><th class=r>min sz</th><th class=r>band</th>
 <th class=r>mid</th><th class=r>our bid/ask</th><th class=r>share</th><th class=r>uptime</th>
@@ -593,11 +813,78 @@ formula — exact. The $ number multiplies it by the market's daily rate × CAL=
 <tr><th>when</th><th>side</th><th>market</th><th class=r>shares</th><th class=r>at</th>
 <th class=r>markout {MARKOUT_MIN}m</th></tr>{frows}</table></div>
 <div class=card><h2>Log</h2>{lrows or '<span class=dim>—</span>'}</div>
-<div class=dim style=font-size:12px>Phase 0 measures: rewards share (exact) + fill rate + adverse selection,
-against the real book and real tape, with a last-in-queue fill model. The go/no-go number for phase 1 is
-net-after-markouts. Repo: <a href=https://github.com/kamilch1k/polymarket-quotebot>polymarket-quotebot</a> ·
+{_settings_card()}
+<div class=dim style=font-size:12px>Paper mode measures rewards share (exact) + fill rate + adverse selection
+against the real book and tape (last-in-queue fill model) — the phase-1 go/no-go. Live mode rests real GTC
+two-sided BUY orders, hard-capped, with a news-move + near-expiry kill switch; no withdrawal/transfer code
+exists in this file. Repo: <a href=https://github.com/kamilch1k/polymarket-quotebot>polymarket-quotebot</a> ·
 sibling of <a href=https://github.com/kamilch1k/polymarket-copybot>polymarket-copybot</a>.</div>
-</div></body></html>"""
+</div>
+<script>
+// action forms submit in place (no reload / scroll jump) with a centered toast
+function toast(m){{var t=document.getElementById('toast');if(!t){{t=document.createElement('div');t.id='toast';document.body.appendChild(t);}}
+t.textContent=m;t.classList.add('show');clearTimeout(toast._h);toast._h=setTimeout(function(){{t.classList.remove('show');}},3000);}}
+document.addEventListener('submit',function(e){{var fm=e.target;if(!fm.matches('form[action^="/"]'))return;
+e.preventDefault();var b=fm.querySelector('button'),lb=b?b.textContent.trim():'saved';
+if(fm.getAttribute('action')==='/panic'&&!confirm('Cancel all live orders and switch to paper?'))return;
+fetch(fm.getAttribute('action'),{{method:'POST',body:new URLSearchParams(new FormData(fm))}})
+.then(function(){{toast('✓ '+lb);return fetch('/');}}).then(function(r){{return r.text();}})
+.then(function(h){{var d=new DOMParser().parseFromString(h,'text/html');document.body.innerHTML=d.body.innerHTML;}})
+.catch(function(){{toast('✗ failed');}});}});
+</script>
+</body></html>"""
+
+
+def _live_card():
+    """The real-money panel: only shown once a funder is set. Positions, cash,
+    ACTUAL reward payouts (the CAL number), resting orders, and a kill switch."""
+    live = live_ok()
+    L = LIVE_LEDGER
+    posval = sum(float(p.get("currentValue") or 0) for p in L["positions"])
+    orders_n = sum(1 for m in ORDERS.values() for o in m.values() if o)
+    cash = f"${L['cash']:,.2f}" if L.get("cash") is not None else "—"
+    body = (f'<div class=cards style=margin-bottom:8px>'
+            f'<div class=c><div class=k>status</div><div class=v style="color:var({"--bad" if live else "--dim"})">'
+            f'{"● quoting live" if live else "◌ configured, not live"}</div></div>'
+            f'<div class=c><div class=k>resting orders</div><div class=v>{orders_n}</div></div>'
+            f'<div class=c><div class=k>inventory value</div><div class=v>${posval:,.2f}</div></div>'
+            f'<div class=c><div class=k>REAL rewards paid</div><div class=v style=color:var(--ok)>'
+            f'${L["rewards_paid"]:,.2f}</div><div class=k>the CAL calibration number</div></div>'
+            f'<div class=c><div class=k>live cap</div><div class=v>${LIVE_BANKROLL:g}</div></div></div>')
+    kill = ('<form method=post action=/panic style=display:inline>'
+            '<button class=kill title="cancel every resting order and switch to paper">'
+            'PANIC — cancel all &amp; go paper</button></form>' if live else '')
+    return (f'<div class=card style="border-color:{"var(--bad)" if live else "var(--line)"}">'
+            f'<h2>Live account — {FUNDER[:6]}…{FUNDER[-4:] if FUNDER else ""} '
+            f'(separate wallet from the copybot)</h2>{body}{kill}</div>')
+
+
+def _settings_card():
+    live = live_ok()
+    return f"""<div class=card><h2>Settings</h2>
+<form method=post action=/settings>
+<div style="display:flex;gap:16px;flex-wrap:wrap">
+<div><label>paper bankroll $</label><input class=in name=paper_bankroll value="{PAPER_BANKROLL:g}" style=width:90px></div>
+<div><label>markets quoted</label><input class=in name=n_markets value="{N_MARKETS}" style=width:70px></div>
+<div><label>quote distance ¢</label><input class=in name=quote_dist_c value="{QUOTE_DIST_C:g}" style=width:70px></div>
+<div><label>min days out</label><input class=in name=min_days_out value="{MIN_DAYS_OUT}" style=width:70px></div>
+<div><label>reward CAL</label><input class=in name=reward_cal value="{REWARD_CAL:g}" style=width:70px></div>
+</div>
+<button class=go style=margin-top:10px>Save paper settings</button></form>
+<hr style="border:0;border-top:1px solid var(--line);margin:14px 0">
+<h2 style="color:var(--bad)">Live quoting — real money (phase 1)</h2>
+<div class=sub>Off by default. Enabling rests real GTC BUY orders on both sides, hard-capped at the live bankroll.
+<b>Use a fresh wallet, funded small, separate from the copybot.</b> There is no withdrawal or transfer code —
+selling to cash and moving funds stay on polymarket.com. Not financial advice.</div>
+<form method=post action=/live-config>
+<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:end">
+<div><label>funder wallet (0x…)</label><input class=in name=funder value="{FUNDER}" placeholder=0x… style=width:340px></div>
+<div><label>private key {'(saved ✓ — blank keeps it)' if (PRIVATE_KEY_MEM or _vault_load()) else '(→ OS vault)'}</label>
+<input class=in name=private_key type=password value="" placeholder="{'••••' if (PRIVATE_KEY_MEM or _vault_load()) else '0x…'}" style=width:200px></div>
+<div><label>live cap $</label><input class=in name=live_bankroll value="{LIVE_BANKROLL:g}" style=width:80px></div>
+</div>
+<label style="margin-top:10px"><input type=checkbox name=live value=1 {'checked' if LIVE else ''}> enable live quoting</label>
+<button class=go style=margin-top:8px>Save live settings</button></form></div>"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -608,6 +895,53 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self):
+        global LIVE, FUNDER, PRIVATE_KEY_MEM, CLIENT
+        path = urlparse(self.path).path
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        f = parse_qs(self.rfile.read(n).decode()) if n else {}
+        g = lambda k, d="": f.get(k, [d])[0]
+
+        def num(k):
+            try:
+                return float(g(k))
+            except ValueError:
+                return None
+        if path == "/settings":
+            for k in ("paper_bankroll", "quote_dist_c", "min_days_out", "reward_cal"):
+                v = num(k)
+                if v is not None:
+                    globals()[k.upper()] = v
+            v = num("n_markets")
+            if v:
+                globals()["N_MARKETS"] = int(v)
+            save_config()
+        elif path == "/live-config":
+            fn = g("funder").strip()
+            if fn.startswith("0x") and len(fn) == 42:
+                FUNDER = fn
+            pk = g("private_key").strip()
+            if pk:
+                PRIVATE_KEY_MEM = pk
+                CLIENT = None
+            v = num("live_bankroll")
+            if v is not None:
+                globals()["LIVE_BANKROLL"] = v
+            new_live = g("live") == "1"
+            if LIVE and not new_live:  # turning live OFF pulls every order first
+                cancel_all_live("live disabled in settings")
+            LIVE = new_live
+            save_config()
+            logline(kind="live", note=f"live quoting {'ENABLED' if live_ok() else 'set (still missing funder/key)' if LIVE else 'DISABLED'}")
+        elif path == "/panic":
+            cancel_all_live("PANIC button")
+            LIVE = False
+            save_config()
+            logline(kind="error", note="PANIC: live quoting OFF, all orders cancelled")
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
 
     def log_message(self, *a):
         pass
@@ -664,6 +998,40 @@ def _check():
     assert quote_sizes(0, 300, 100) == (100, 100)
     assert quote_sizes(300, 300, 100) == (0.0, 100)
     assert quote_sizes(-300, 300, 100) == (100, 0.0)
+    # LIVE ENGINE (phase 1) — all pure, no network:
+    # two-sided quote = two BUYS, YES at mid−d and NO at 1−(mid+d)
+    yp, np_, sz = desired_quotes(0.50, 2.0, 100)
+    assert yp == 0.48 and np_ == 0.48 and sz == 100  # symmetric at mid 0.50
+    yp, np_, _ = desired_quotes(0.30, 2.0, 100)
+    assert abs(yp - 0.28) < 1e-9 and abs(np_ - 0.68) < 1e-9  # NO side = 1−0.32
+    assert desired_quotes(0.995, 2.0, 100) is None    # too close to the edge → no quote
+    # requote hysteresis: only replace on a real drift
+    assert needs_replace(None, 0.48, 100) is True
+    assert needs_replace({"px": 0.48, "sz": 100}, 0.48, 100) is False
+    assert needs_replace({"px": 0.48, "sz": 100}, 0.485, 100, tol_c=0.5) is True
+    # kill switch: near-expiry and a 10-min news move both stand the market down
+    _now = 1_000_000.0
+    assert any("ends in" in r for r in kill_reasons({"end_ts": _now + 3 * 86400}, {}, _now))
+    moved = kill_reasons({"end_ts": _now + 60 * 86400},
+                         {"mid": 0.60, "mid_hist": [(_now - 700, 0.50)]}, _now)
+    assert any("news pause" in r for r in moved)
+    assert kill_reasons({"end_ts": _now + 60 * 86400},
+                        {"mid": 0.505, "mid_hist": [(_now - 700, 0.50)]}, _now) == []  # 0.5c = calm
+    # the live gate: nothing trades without flag AND funder AND key
+    globals()["LIVE"], globals()["FUNDER"], globals()["PRIVATE_KEY_MEM"] = False, "", None
+    assert not live_ok()
+    globals()["LIVE"] = True
+    assert not live_ok()                              # flag alone is not enough
+    globals()["FUNDER"], globals()["PRIVATE_KEY_MEM"] = "0x" + "a" * 40, "0x" + "b" * 32
+    assert live_ok()
+    globals()["LIVE"], globals()["FUNDER"], globals()["PRIVATE_KEY_MEM"] = False, "", None
+    # live notional cap accounting: resting orders + inventory cost
+    ORDERS.clear()
+    ORDERS["m"] = {"yes": {"id": "1", "px": 0.5, "sz": 100}, "no": {"id": "2", "px": 0.4, "sz": 100}}
+    LIVE_LEDGER["positions"] = [{"initialValue": "20"}]
+    assert abs(live_notional() - (50 + 40 + 20)) < 1e-9
+    ORDERS.clear()
+    LIVE_LEDGER["positions"] = []
     # watched universe survives a restart (restart ≠ rescan ≠ dataset gap)
     STATE["watched"] = [{"cid": "w1", "tid": "t", "tid_no": "tn", "q": "Q?", "rate": 9,
                          "min_size": 50, "max_spread": 4.5, "mid": 0.5, "days": 30.0}]
@@ -676,15 +1044,27 @@ def _check():
     STATE_FILE.unlink(missing_ok=True)
     # dashboard renders without a network in sight; DOM-parsed refresh (the raw-regex
     # version once matched its own source and injected it into the page)
-    page = render()
-    assert "Quotebot" in page and "phase 0" in page and "no key" in page
+    page = render()  # default state = paper: the badge and disclaimer say so
+    assert "paper — no money" in page and "Live quoting is OFF" in page
     assert "http-equiv=refresh" not in page and "DOMParser" in page
     assert "[\\s\\S]" not in page and "unrealized" in page
-    assert "touches no wallet" in page  # the no-real-money disclaimer stays on the page
-    # phase-0 safety claim is grep-true: no order path exists in this file
+    # grep-true SAFETY INVARIANTS of the live engine (the honest phase-1 claims).
+    # Needles are split so this scan never counts its own literals.
     src = Path(__file__).read_text(encoding="utf-8")
-    for needle in ("post_order", "create_order", "private_key", "eth_account", "OrderArgs"):
-        assert src.count(needle) == 1, f"order-path token {needle} appears outside this assertion!"
+    n = lambda a, b: src.count(a + b)
+    #  1) the one and only OrderArgs is a GTC BUY — no sell, no market order
+    assert n("Order", "Args(") == 1 and n('side="B', 'UY"') == 1
+    assert n('side="S', 'ELL"') == 0 and n("Market", "OrderArgs") == 0
+    assert n("OrderType.G", "TC") == 1 and n("OrderType.F", "AK") == 0
+    #  2) exactly one post_order and one create_order call site (inside _post)
+    assert n("post_", "order(") == 1 and n("create_", "order(") == 1
+    #  3) no fund-movement CODE — the CLOB client's transfer/withdraw call shapes
+    #  (English 'transfer'/'withdraw' in prose is fine; these are the API tokens)
+    for a, b in (("eth_sendRaw", "Transaction"), ("send_", "transaction"),
+                 (".trans", "fer("), (".with", "draw("), ("create_", "withdrawal")):
+        assert n(a, b) == 0, f"fund-movement call '{a + b}' must not exist"
+    #  4) every real order flows through the live_ok gate (flag+funder+key)
+    assert "def live_ok" in src and "if live_ok():" in src
     print("self-check OK")
 
 
