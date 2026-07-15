@@ -14,11 +14,18 @@ he just earned — the sign flips at the boundary). But you can *become* one,
 and Polymarket explicitly subsidizes it. The question is whether it pays at
 hobby scale. This repo measures that instead of guessing.
 
-## Phase 0 — paper, running now
+## Two modes: paper (default) and live
 
-**No orders, no key, no money.** The file contains no order-placement code at
-all — the self-test greps itself to prove the claim stays true. What it does,
-against fully public endpoints:
+**Paper is the default and needs nothing** — no key, no wallet, no money. It's
+the measurement rig. **Live** is a flag you turn on in Settings once the paper
+number convinces you; it rests real orders, hard-capped. The engine's safety
+shape is enforced by grep-true self-tests: the only order struct is a **GTC
+BUY** (no sells, no market orders), and there is **no transfer/withdraw code**
+anywhere — selling to cash and moving funds stay on polymarket.com.
+
+### Phase 0 — paper (the measurement)
+
+What it does, against fully public endpoints:
 
 - **scans the universe** every 6h for reward-paying markets (`min_size`,
   `max_spread`, daily budget from the CLOB metadata), keeps only
@@ -50,15 +57,29 @@ $150k LP account we studied was quoting ($254/day reward budget), plus
 Iran-Hormuz ($100/day) where at scan time **no other maker had a qualifying
 two-sided quote** — the honest caveat being that empty bands rarely stay empty.
 
-## What phase 1 would be (only if phase 0's number is green)
+### Phase 1 — live (built, off by default)
 
-A separate tiny wallet ($100–300), GTC quotes in one or two low-minimum
-markets, an event kill-switch, and calibration of the reward model against
-real daily payouts. Hard rules already decided: **separate wallet from the
-copybot** (its budget math reads whole-wallet balances), and **the two bots
-never touch the same market** (self-matching between accounts you own is wash
-trading — banned, and rightly so). Expected earnings at that scale: coffee
-money. The deliverable is the measured yield curve, not the yield.
+Turn it on in Settings with a funder wallet + key (key goes to the OS
+credential vault). It then, in parallel with the untouched paper sim:
+
+- rests **two-sided GTC BUYs** — YES at mid−d and NO at 1−(mid+d); a fresh
+  wallet owns no tokens so it can't rest a sell, and two BUYs *is* the
+  qualifying two-sided book (a filled pair sums to $1 at resolution)
+- **hard notional cap** (`LIVE_BANKROLL`, default $100): resting-order cost +
+  inventory can never exceed it, enforced atomically before each post
+- **kill switch**: cancels and stands down on any market within
+  `KILL_END_DAYS` of expiry or after a `KILL_MOVE_C`-cent mid move in 10
+  minutes (news → stale quotes get picked off), and a **PANIC** button that
+  cancels everything and reverts to paper
+- reads the account's **actual REWARD payouts** — the CAL number this whole
+  experiment exists to calibrate
+
+Hard rules, enforced: **separate wallet from the copybot** (its budget math
+reads whole-wallet balances), and **the two bots never touch the same market**
+(self-matching between your own accounts is wash trading — banned; quotebot's
+≥14d non-sports filter is the structural half). Expected earnings at this
+scale: coffee money — the deliverable is the measured yield curve, not the
+yield. Start with the smallest real quote that qualifies and let it calibrate.
 
 ## Run
 
